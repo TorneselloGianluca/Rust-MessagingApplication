@@ -1,0 +1,33 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true, features = ["codec"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+rusqlite = { workspace = true, features = ["bundled"] }
+argon2 = { workspace = true, features = ["std"] }
+rand = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+futures-util = { workspace = true, features = ["sink"] }
+
+# Dipendenze per il Monitoring (ereditate dal workspace)
+sysinfo = { workspace = true }
+chrono = { workspace = true }
+
+shared = { path = "../shared" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-util = { workspace = true, features = ["codec"] }
+futures-util = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+shared = { path = "../shared" }

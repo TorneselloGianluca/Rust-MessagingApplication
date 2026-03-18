@@ -1,0 +1,225 @@
+
+
+*********************************************
+e2e_private_chat_test_monitoring - 07/12/2025 18:30 
+*********************************************
+
+__________________________________________
+TEST 1:
+- Info: 10 Users, 60 sec duration, 1000 ms interval
+- Data: 07/12/2025 18:31
+- Performance Server:
+> Avg CPU: 14.63%
+> Max RAM: 26 MB
+- Risultato: 600 / 600 messaggi (Efficienza 100.00%)
+__________________________________________
+
+__________________________________________
+TEST 2:
+- Info: 25 Users, 60 sec duration, 1000 ms interval
+- Data: 07/12/2025 18:33
+- Performance Server:
+> Avg CPU: 30.72%
+> Max RAM: 30 MB
+- Risultato: 1500 / 1500 messaggi (Efficienza 100.00%)
+__________________________________________
+
+__________________________________________
+TEST 3:
+- Info: 50 Users, 60 sec duration, 1000 ms interval
+- Data: 07/12/2025 18:34
+- Performance Server:
+> Avg CPU: 48.36%
+> Max RAM: 35 MB
+- Risultato: 3000 / 3000 messaggi (Efficienza 100.00%)
+__________________________________________
+
+__________________________________________
+TEST 4:
+- Info: 100 Users, 60 sec duration, 1000 ms interval
+- Data: 07/12/2025 18:37
+- Performance Server:
+> Avg CPU: 67.30%
+> Max RAM: 44 MB
+- Risultato: 6000 / 6000 messaggi (Efficienza 100.00%)
+__________________________________________
+
+__________________________________________
+TEST 5:
+- Info: 150 Users, 60 sec duration, 1000 ms interval
+- Data: 07/12/2025 18:41
+- Performance Server:
+> Avg CPU: 76.88%
+> Max RAM: 59 MB
+- Risultato: 8999 / 9000 messaggi (Efficienza 99.99%)
+__________________________________________
+
+__________________________________________
+TEST 6:
+- Info: 250 Users, 60 sec duration, 1000 ms interval
+- Data: 07/12/2025 18:46
+- Performance Server:
+> Avg CPU: 84.10%
+> Max RAM: 79 MB
+- Risultato: 9691 / 15000 messaggi (Efficienza 64.61%)
+
+Un primo problema che notiamo è dato da SQLite con il seguente errore:
+
+[SERVER ERROR to u6_240_54738422]: db error: database is locked
+[SERVER ERROR to u6_216_54738422]: db error: database is locked
+[SERVER ERROR to u6_5_54738422]: db error: database is locked
+[SERVER ERROR to u6_28_54738422]: db error: database is locked
+[SERVER ERROR to u6_247_54738422]: db error: database is locked
+[SERVER ERROR to u6_5_54738422]: db error: database is locked
+
+Il motivo: SQLite è un database basato su file. Di default, permette un solo scrittore alla volta. 
+Quando 250 utenti provano a inviare messaggi (scrivere nel DB) nello stesso istante, si crea una coda. 
+Se un thread aspetta troppo tempo per ottenere il "lock" (il permesso di scrivere), 
+SQLite va in timeout e restituisce l'errore database is locked.
+
+La Soluzione (ottimizazione): Modalità WAL e Busy Timeout
+Dobbiamo configurare SQLite per gestire meglio la concorrenza. 
+Dobbiamo attivare la modalità WAL (Write-Ahead Logging) e aumentare il tempo di attesa (busy_timeout).
+
+Modifiche Apportate
+
+Modificata la funzione SqliteStorage::new aggiungendo tre configurazioni (PRAGMA) 
+fondamentali per SQLite in ambienti multi-thread/multi-processo:
+    -   journal_mode = WAL: Attiva il Write-Ahead Logging. Questo cambia radicalmente il modo in cui SQLite gestisce i lock. 
+        Invece di bloccare l'intero database per una scrittura, scrive le modifiche in un file a parte. 
+        Questo permette a lettori e scrittori di operare contemporaneamente.
+    -   busy_timeout = 5000: Imposta un tempo di attesa di 5 secondi (5000 ms). 
+        Se il database è occupato da un altro thread, invece di restituire subito errore, 
+        Rust aspetterà fino a 5 secondi che si liberi.
+    -   synchronous = NORMAL: Ottimizza la velocità di scrittura su disco quando si usa la modalità WAL, 
+        riducendo il numero di operazioni di I/O (fsync) necessarie, mantenendo comunque una buona sicurezza dei dati.
+        OTTIMIZZATO 
+            -   Problema: Prima ricevevi "Credenziali errate" perché il server provava a leggere 
+                l'utente mentre SQLite lo stava ancora scrivendo nella cache, a causa di "synchronous = NORMAL"
+            -   Soluzione: Impostando synchronous = FULL in storage.rs, viene garantito che quando il server risponde "Registrato", 
+                il dato è fisicamente sul disco. Il login successivo trova il dato al 100%.
+
+Un secondo problema da risolvere è la precisione del Timestamp:
+
+Nel codice storage.rs questa funzione:
+
+fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
+Usa as_secs() (Secondi). Sotto stress test con 250 utenti, vengono inviati probabilmente 200-300 messaggi nello stesso secondo. 
+Tutti questi messaggi avranno lo stesso identico timestamp (es. 1700001234).
+Quando avviene la query: SELECT ... ORDER BY sent_at DESC
+Se 100 messaggi hanno lo stesso orario, il database non sa quale mettere prima. 
+L'ordine diventa "casuale" (o basato su dettagli interni non prevedibili).
+
+La Soluzione:
+
+Per garantire l'ordine corretto anche sotto stress, bisogna passare ai millisecondi,
+modificando la funzione now_unix in server/src/storage.rs:
+
+fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Usa as_millis() invece di as_secs()
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
+In questo modo:
+    -   Prima: 2 messaggi nello stesso secondo -> Conflitto di ordinamento.
+    -   Ora: 2 messaggi devono arrivare nello stesso millesimo di secondo per avere conflitto (molto più raro).
+
+Ottimizzazione stress test code:
+    -   Ramp-up (Partenza Scaglionata): Invece di lanciare 'n'' richieste di connessione nello stesso millisecondo 
+        (che causano un "Thundering Herd" sul server), viene inserita una pausa impercettibile (5ms) tra un client e l'altro.
+    -   Smart Retry su Login: con SQLite in modalità WAL sincrona (FULL), c'è una latenza fisica tra il comando INSERT (Registrazione) 
+        e il momento in cui il dato è leggibile per la SELECT (Login).
+        Invece di crashare subito, il client "capisce" che il server è occupato e riprova dopo 200ms. Questo assorbe le latenze del disco.
+        Se la porta del server è satura momentaneamente, il client non si arrende ma riprova la connessione TCP fino a 10 secondi.
+    -   Monitoring a bassa frequenza: la libreria sysinfo deve fare molte chiamate al sistema operativo per leggere CPU e RAM. 
+        Farlo ogni secondo su un carico pesante "ruba" tempo al processore che dovrebbe invece gestire i messaggi.
+        Campionare ogni 3 secondi fornisce comunque una media valida ma riduce l'overhead del monitoring del 66%.
+        Tecnica: Tokio Worker Threads -> #[tokio::test(flavor = "multi_thread", worker_threads = 32)]
+        Aumentando i thread del runtime a 32, permetti a Tokio di parallelizzare meglio i 250 task dei 
+        client + il task del server + il task del monitoring, evitando che un task "pesante" blocchi gli altri.
+__________________________________________
+
+
+*********************************************
+PRIVATE CHAT STRESS TEST - 08/12/2025 11:47 test
+*********************************************
+
+__________________________________________
+TEST 1:
+- Info: 10 Users, 60s duration, 1000ms interval
+- Data: 08/12/2025 11:48
+- Performance Server:
+> Avg CPU: 7.72%
+> Max RAM: 26 MB
+- Risultato: 600 / 600 messaggi (Efficienza 100.00%)
+__________________________________________
+
+__________________________________________
+TEST 2:
+- Info: 25 Users, 60s duration, 1000ms interval
+- Data: 08/12/2025 11:50
+- Performance Server:
+> Avg CPU: 25.12%
+> Max RAM: 30 MB
+- Risultato: 1500 / 1500 messaggi (Efficienza 100.00%)
+__________________________________________
+
+__________________________________________
+TEST 3:
+- Info: 50 Users, 60s duration, 1000ms interval
+- Data: 08/12/2025 11:52
+- Performance Server:
+> Avg CPU: 42.44%
+> Max RAM: 37 MB
+- Risultato: 3000 / 3000 messaggi (Efficienza 100.00%)
+__________________________________________
+
+__________________________________________
+TEST 4:
+- Info: 100 Users, 60s duration, 1000ms interval
+- Data: 08/12/2025 11:54
+- Performance Server:
+> Avg CPU: 61.82%
+> Max RAM: 48 MB
+- Risultato: 6000 / 6000 messaggi (Efficienza 100.00%)
+__________________________________________
+
+__________________________________________
+TEST 5:
+- Info: 150 Users, 60s duration, 1000ms interval
+- Data: 08/12/2025 11:58
+- Performance Server:
+> Avg CPU: 72.21%
+> Max RAM: 60 MB
+- Risultato: 8999 / 9000 messaggi (Efficienza 99.99%)
+__________________________________________
+
+__________________________________________
+TEST 6:
+- Info: 250 Users, 60s duration, 1000ms interval
+- Data: 08/12/2025 12:03
+- Performance Server:
+> Avg CPU: 81.31%
+> Max RAM: 83 MB
+- Risultato: 15000 / 15000 messaggi (Efficienza 100.00%)
+__________________________________________
+
+
+*********************************************
+PRIVATE CHAT STRESS TEST - 10/12/2025 13:26 test
+*********************************************
+
+__________________________________________
+TEST 1:
+- Info: 10 Users, 60s duration, 1000ms interval
+- Data: 10/12/2025 13:27
+- Performance Server:
+> Avg CPU: 9.23%
+> Max RAM: 28 MB
+- Risultato: 600 / 600 messaggi (Efficienza 100.00%)
+__________________________________________
